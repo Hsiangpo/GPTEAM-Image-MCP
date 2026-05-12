@@ -1,0 +1,33 @@
+{
+  "name": "gpteam-image-mcp",
+  "version": "0.1.26",
+  "description": "GPTeam Image MCP server for image generation and editing through GPTeam OpenAI-compatible image APIs.",
+  "type": "module",
+  "bin": {
+    "gpteam-image-mcp": "bin/gpteam-image-mcp.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.MD"
+  ],
+  "scripts": {
+    "start": "node bin/gpteam-image-mcp.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hsiangpo/GPTeam-Image-MCP.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Hsiangpo/GPTeam-Image-MCP/issues"
+  },
+  "homepage": "https://github.com/Hsiangpo/GPTeam-Image-MCP#readme",
+  "license": "UNLICENSED"
+}
