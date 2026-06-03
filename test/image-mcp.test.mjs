@@ -53,7 +53,7 @@ test('loadGPTeamCredentials reads MCP environment key and base url', () => {
   const credentials = loadGPTeamCredentials({
     env: {
       GPTEAM_API_KEY: 'sk-from-mcp-env',
-      GPTEAM_BASE_URL: 'https://api-jp.gpteamservices.com/v1'
+      GPTEAM_BASE_URL: 'https://api-jp.gpteamservices.com'
     },
     home: os.homedir()
   });
@@ -72,7 +72,7 @@ test('loadGPTeamCredentials fails closed when no key exists', () => {
 test('loadGPTeamCredentials never reads Codex auth as an MCP key source', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gpteam-image-mcp-'));
   fs.writeFileSync(path.join(tmp, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'sk-official' }), 'utf8');
-  fs.writeFileSync(path.join(tmp, 'config.toml'), '[model_providers.gpteam]\nbase_url = "https://api.gpteamservices.com/v1"\n', 'utf8');
+  fs.writeFileSync(path.join(tmp, 'config.toml'), '[model_providers.gpteam]\nbase_url = "https://api.gpteamservices.com"\n', 'utf8');
 
   assert.throws(
     () => loadGPTeamCredentials({ env: { GPTEAM_CODEX_HOME: tmp }, home: os.homedir() }),
@@ -101,11 +101,11 @@ test('parseGPTeamBaseUrl only reads model_providers.gpteam base_url', () => {
     'base_url = "https://other.example/v1"',
     '',
     '[model_providers.gpteam]',
-    'base_url = "https://api.gpteamservices.com/v1"',
+    'base_url = "https://api.gpteamservices.com"',
     ''
   ].join('\n');
 
-  assert.equal(parseGPTeamBaseUrl(config), 'https://api.gpteamservices.com/v1');
+  assert.equal(parseGPTeamBaseUrl(config), 'https://api.gpteamservices.com');
 });
 
 test('normalizeBaseUrl removes trailing slashes and appends v1 when needed', () => {
@@ -122,7 +122,7 @@ test('generateImage calls GPTeam images endpoint and saves returned base64 image
   }, {
     env: {
       GPTEAM_API_KEY: 'sk-test',
-      GPTEAM_BASE_URL: 'https://api.example.test/v1'
+      GPTEAM_BASE_URL: 'https://api.example.test'
     },
     fetch: async (url, options) => {
       calls.push({ url, options });
