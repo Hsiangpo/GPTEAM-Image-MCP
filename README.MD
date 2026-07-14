@@ -1,4 +1,4 @@
-# GPTeam Image MCP
+# GPTEAM Image MCP
 
 GPTeam Image MCP 是一个面向 MCP 客户端的图片生成与图片编辑服务。它通过 GPTeam 的 OpenAI 兼容图片接口发起请求，支持文生图、图生图、局部编辑、本地保存、任务查询和取消。
 
