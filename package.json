@@ -1,6 +1,6 @@
 {
   "name": "gpteam-image-mcp",
-  "version": "0.1.40",
+  "version": "0.1.41",
   "description": "GPTeam Image MCP server for image generation and editing through GPTeam OpenAI-compatible image APIs.",
   "type": "module",
   "bin": {

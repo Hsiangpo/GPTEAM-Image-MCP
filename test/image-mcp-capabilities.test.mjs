@@ -104,8 +104,12 @@ test('auth, empty, malformed, unsupported schema, redirect, and refresh failures
   );
 });
 
-test('legacy fallback is bounded to an explicit trusted GPTEAM summary and gpt-image-2', async () => {
-  const fetch404 = async () => ({ ok: false, status: 404, text: async () => 'not found' });
+test('schema-v1 endpoint absence never downgrades Image MCP to ordinary image routes', async () => {
+  const urls = [];
+  const fetch404 = async (url) => {
+    urls.push(String(url));
+    return { ok: false, status: 404, text: async () => 'not found' };
+  };
   const recognizedSummary = {
     image_mcp: {
       enabled: true,
@@ -116,47 +120,17 @@ test('legacy fallback is bounded to an explicit trusted GPTEAM summary and gpt-i
       max_queued_jobs: 20
     }
   };
-  const fallback = await fetchImageCapabilities(credentialsA, {
-    cache: createCapabilityCache(),
-    fetch: fetch404,
-    allowLegacyFallback: true,
-    trustedLegacyOrigin: 'https://api.example.test',
-    legacySummary: recognizedSummary
-  });
-  assert.equal(fallback.legacy, true);
-  assert.deepEqual(fallback.models.map((model) => model.id), ['gpt-image-2']);
-
-  const urls = [];
-  const fetchedFallback = await fetchImageCapabilities(credentialsA, {
-    cache: createCapabilityCache(), allowLegacyFallback: true,
-    trustedLegacyOrigin: 'https://api.example.test',
-    fetch: async (url) => {
-      urls.push(String(url));
-      return urls.length === 1 ? await fetch404() : jsonResponse(recognizedSummary);
-    }
-  });
-  assert.equal(fetchedFallback.legacy, true);
-  assert.deepEqual(urls, [
-    'https://api.example.test/v1/gpteam/image-capabilities',
-    'https://api.example.test/v1/gpteam/config-capabilities'
-  ]);
-
-  for (const override of [
-    { allowLegacyFallback: false },
-    { trustedLegacyOrigin: 'https://wrong.example' },
-    { legacySummary: { image_mcp: { enabled: true, default_model: 'other-image' } } }
-  ]) {
-    await assert.rejects(
-      fetchImageCapabilities(credentialsA, {
-        cache: createCapabilityCache(), fetch: fetch404,
-        allowLegacyFallback: true,
-        trustedLegacyOrigin: 'https://api.example.test',
-        legacySummary: {},
-        ...override
-      }),
-      (error) => error.code === 'capability_endpoint_unavailable'
-    );
-  }
+  await assert.rejects(
+    fetchImageCapabilities(credentialsA, {
+      cache: createCapabilityCache(),
+      fetch: fetch404,
+      allowLegacyFallback: true,
+      trustedLegacyOrigin: 'https://api.example.test',
+      legacySummary: recognizedSummary
+    }),
+    (error) => error.code === 'capability_endpoint_unavailable'
+  );
+  assert.deepEqual(urls, ['https://api.example.test/v1/gpteam/image-capabilities']);
 });
 
 test('normalization preserves action-specific profiles and dynamic Gemini parameters', () => {
@@ -343,6 +317,18 @@ test('schema-v1 parser rejects malformed numeric bounds, defaults, enums, and co
   }
 });
 
+test('schema-v1 parser rejects ordinary image endpoints outside the dedicated MCP namespace', () => {
+  for (const endpoint of ['/v1/images/generations', '/v1/images/edits', 'https://other.example/v1/gpteam/image-mcp/images/generations']) {
+    const payload = capabilityFixture();
+    payload.image_mcp.models[0].actions.generate.endpoint = endpoint;
+    assert.throws(
+      () => normalizeImageCapabilities(payload),
+      (error) => error.code === 'capability_response_invalid',
+      endpoint
+    );
+  }
+});
+
 test('get_capabilities summary exposes group, revision, actions, parameters, cache age, and queue limits only', () => {
   const capabilities = normalizeImageCapabilities(capabilityFixture());
   const summary = summarizeImageCapabilities(capabilities, { cacheAgeMS: 321 });
@@ -454,7 +440,8 @@ test('queued jobs fail stale on group, permission, model, profile, or refresh ch
 });
 
 test('cached tool schemas cannot bypass runtime validation and dynamic dispatch never replays a paid request', async () => {
-  let imageCalls = 0;
+	let imageCalls = 0;
+	const imageURLs = [];
   const store = createImageJobStore();
   const deps = {
     store,
@@ -463,6 +450,7 @@ test('cached tool schemas cannot bypass runtime validation and dynamic dispatch 
     fetch: async (url) => {
       if (String(url).endsWith('/gpteam/image-capabilities')) return jsonResponse(capabilityFixture());
       imageCalls += 1;
+	  imageURLs.push(String(url));
       throw new TypeError('ambiguous disconnect after dispatch');
     }
   };
@@ -478,6 +466,7 @@ test('cached tool schemas cannot bypass runtime validation and dynamic dispatch 
   const status = await waitForStatus(store, created.job_id, 'failed');
   assert.equal(status.error.code, 'network_error');
   assert.equal(imageCalls, 1, 'possibly accepted dynamic requests are never replayed');
+	assert.deepEqual(imageURLs, ['https://api.example.test/v1/gpteam/image-mcp/images/generations']);
 });
 
 function capabilityFixture(overrides = {}) {
@@ -552,8 +541,8 @@ function modelFixture(overrides = {}) {
     eligible: true,
     routable_by_contract: true,
     actions: {
-      generate: actionFixture('/v1/images/generations', generateParameters),
-      edit: actionFixture('/v1/images/edits', editParameters)
+      generate: actionFixture('/v1/gpteam/image-mcp/images/generations', generateParameters),
+      edit: actionFixture('/v1/gpteam/image-mcp/images/edits', editParameters)
     }
   };
 }

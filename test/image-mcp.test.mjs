@@ -139,7 +139,7 @@ test('generateImage calls GPTEAM images endpoint and saves returned base64 image
     }
   });
 
-  assert.equal(calls[0].url, 'https://api.example.test/v1/images/generations');
+  assert.equal(calls[0].url, 'https://api.example.test/v1/gpteam/image-mcp/images/generations');
   assert.equal(calls[0].options.headers.Authorization, 'Bearer sk-test');
   assert.equal(JSON.parse(calls[0].options.body).model, 'gpt-image-2');
   assert.equal(JSON.parse(calls[0].options.body).stream, true);
@@ -196,7 +196,7 @@ test('generateImage supports Image 2 edit inputs from local files and masks', as
     }
   });
 
-  assert.equal(calls[0].url, 'https://api.example.test/v1/images/edits');
+  assert.equal(calls[0].url, 'https://api.example.test/v1/gpteam/image-mcp/images/edits');
   assert.match(calls[0].body.images[0].image_url, /^data:image\/png;base64,/);
   assert.match(calls[0].body.mask.image_url, /^data:image\/png;base64,/);
   assert.equal(calls[0].body.input_fidelity, undefined);
@@ -227,7 +227,7 @@ test('generateImage accepts common image-to-image alias fields', async () => {
     }
   });
 
-  assert.equal(calls[0].url, 'https://api.example.test/v1/images/edits');
+  assert.equal(calls[0].url, 'https://api.example.test/v1/gpteam/image-mcp/images/edits');
   assert.equal(calls[0].body.images.length, 2);
   assert.match(calls[0].body.images[0].image_url, /^data:image\/png;base64,/);
   assert.match(calls[0].body.images[1].image_url, /^data:image\/png;base64,/);
@@ -760,8 +760,8 @@ function imageCapabilityResponse() {
           id: 'gpt-image-2', platform: 'openai', contract_revision: 1,
           eligible: true, routable_by_contract: true,
           actions: {
-            generate: { endpoint: '/v1/images/generations', eligible: true, execution_profiles: [profile] },
-            edit: { endpoint: '/v1/images/edits', eligible: true, execution_profiles: [{
+            generate: { endpoint: '/v1/gpteam/image-mcp/images/generations', eligible: true, execution_profiles: [profile] },
+            edit: { endpoint: '/v1/gpteam/image-mcp/images/edits', eligible: true, execution_profiles: [{
               ...profile,
               parameters: [...parameters, {
                 name: 'images', description: '输入图片', type: 'string_array', required: true,
