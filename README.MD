@@ -34,6 +34,10 @@ Node.js 需要 `18.18.0` 或更高版本。推荐先运行 `npx gpteam`，让 GP
 
 不要根据旧文档猜模型名、尺寸、质量或供应商参数。分组、模型、Profile 或权限变化后，能力缓存最多保留 60 秒；任务在首次付费派发前还会强制刷新修订号。合同变化会在上游请求前返回 `stale_capability`，不会用旧能力继续派发。
 
+schema-v1 动作只允许派发到同一 GPTEAM Origin 下的 `/v1/gpteam/image-mcp/images/generations` 和 `/v1/gpteam/image-mcp/images/edits`（以及无 `/v1` 的兼容别名）。普通 `/v1/images/*` 与 `/images/*` 不进入 Image MCP 合同执行器；客户端缺少 schema v1、返回普通图片路径或返回其它 Origin 时，MCP 会失败关闭，不会自动降级。
+
+用户在使用过程中切换 Key 分组后不需要重装或重新配置 MCP。缓存最迟 60 秒刷新；已经排队但尚未首次派发的任务会强制重新读取 revision，旧分组能力不再有效时返回 `stale_capability`，重新调用 `get_capabilities` 后按新分组选择即可。
+
 ## MCP 工具
 
 - `get_capabilities`：返回当前 Key 的分组摘要、能力修订、模型、动作、Profile、参数约束、默认值、队列限制和可选实时可用性观察。
