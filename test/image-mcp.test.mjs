@@ -11,11 +11,10 @@ import {
   createImageJobStore,
   downloadImageResult,
   generateImage,
-  getCapabilities,
   getImageJobStatus,
-  loadGPTeamCredentials,
+  loadGPTEAMCredentials,
   normalizeBaseUrl,
-  parseGPTeamBaseUrl,
+  parseGPTEAMBaseUrl,
   resultFromError,
   structuredToolResult,
   toolResultContent,
@@ -23,6 +22,7 @@ import {
 } from '../lib/image-mcp/image.js';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { callImageTool, createServer, resolvePackageVersion } from '../lib/image-mcp/server.js';
+import { createCapabilityCache } from '../lib/image-mcp/capabilities.js';
 
 const PNG_1X1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lAQcIgAAAABJRU5ErkJggg==',
@@ -49,50 +49,50 @@ test('buildImageGenerationPayload prefers explicit output_format consistently', 
   }).output_format, 'webp');
 });
 
-test('loadGPTeamCredentials reads MCP environment key and base url', () => {
-  const credentials = loadGPTeamCredentials({
+test('loadGPTEAMCredentials reads MCP environment key and base url', () => {
+  const credentials = loadGPTEAMCredentials({
     env: {
       GPTEAM_API_KEY: 'sk-from-mcp-env',
-      GPTEAM_BASE_URL: 'https://api-jp.gpteamservices.com'
+      GPTEAM_BASE_URL: 'https://custom-api.example'
     },
     home: os.homedir()
   });
 
   assert.equal(credentials.apiKey, 'sk-from-mcp-env');
-  assert.equal(credentials.baseUrl, 'https://api-jp.gpteamservices.com/v1');
+  assert.equal(credentials.baseUrl, 'https://custom-api.example/v1');
 });
 
-test('loadGPTeamCredentials fails closed when no key exists', () => {
+test('loadGPTEAMCredentials fails closed when no key exists', () => {
   assert.throws(
-    () => loadGPTeamCredentials({ env: {}, readFile: () => '{}' }),
-    /没有找到 GPTeam API key/
+    () => loadGPTEAMCredentials({ env: {}, readFile: () => '{}' }),
+    /没有找到 GPTEAM API key/
   );
 });
 
-test('loadGPTeamCredentials never reads Codex auth as an MCP key source', () => {
+test('loadGPTEAMCredentials never reads Codex auth as an MCP key source', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gpteam-image-mcp-'));
   fs.writeFileSync(path.join(tmp, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'sk-official' }), 'utf8');
   fs.writeFileSync(path.join(tmp, 'config.toml'), '[model_providers.gpteam]\nbase_url = "https://api.gpteamservices.com"\n', 'utf8');
 
   assert.throws(
-    () => loadGPTeamCredentials({ env: { GPTEAM_CODEX_HOME: tmp }, home: os.homedir() }),
-    /没有找到 GPTeam API key/
+    () => loadGPTEAMCredentials({ env: { GPTEAM_CODEX_HOME: tmp }, home: os.homedir() }),
+    /没有找到 GPTEAM API key/
   );
 });
 
-test('loadGPTeamCredentials does not use inherited OPENAI_API_KEY as the MCP key', () => {
+test('loadGPTEAMCredentials does not use inherited OPENAI_API_KEY as the MCP key', () => {
   assert.throws(
-    () => loadGPTeamCredentials({
+    () => loadGPTEAMCredentials({
       env: {
         OPENAI_API_KEY: 'sk-official-openai'
       },
       readFile: () => ''
     }),
-    /没有找到 GPTeam API key/
+    /没有找到 GPTEAM API key/
   );
 });
 
-test('parseGPTeamBaseUrl only reads model_providers.gpteam base_url', () => {
+test('parseGPTEAMBaseUrl only reads model_providers.gpteam base_url', () => {
   const config = [
     '[mcp_servers.local]',
     'base_url = "http://localhost:8080"',
@@ -105,7 +105,7 @@ test('parseGPTeamBaseUrl only reads model_providers.gpteam base_url', () => {
     ''
   ].join('\n');
 
-  assert.equal(parseGPTeamBaseUrl(config), 'https://api.gpteamservices.com');
+  assert.equal(parseGPTEAMBaseUrl(config), 'https://api.gpteamservices.com');
 });
 
 test('normalizeBaseUrl removes trailing slashes and appends v1 when needed', () => {
@@ -113,7 +113,7 @@ test('normalizeBaseUrl removes trailing slashes and appends v1 when needed', () 
   assert.equal(normalizeBaseUrl('https://api.gpteamservices.com'), 'https://api.gpteamservices.com/v1');
 });
 
-test('generateImage calls GPTeam images endpoint and saves returned base64 image', async () => {
+test('generateImage calls GPTEAM images endpoint and saves returned base64 image', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gpteam-image-mcp-'));
   const calls = [];
   const result = await generateImage({
@@ -532,35 +532,6 @@ test('createImageJob reuses idempotency_key and enforces local queue limits', as
   cancelImageJob({ job_id: second.job_id }, { store });
 });
 
-test('getCapabilities reports async image edit support and queue limits', () => {
-  const caps = getCapabilities({
-    env: {
-      GPTEAM_IMAGE_MAX_CONCURRENT: '3',
-      GPTEAM_IMAGE_MAX_QUEUE: '9'
-    }
-  });
-
-  assert.equal(caps.ok, true);
-  assert.equal(caps.default_model, 'gpt-image-2');
-  assert.equal(caps.supports_async, true);
-  assert.equal(caps.supports_image_to_image, true);
-  assert.deepEqual(caps.image_input_fields, ['images', 'image', 'image_path', 'image_paths', 'input_image', 'input_images']);
-  assert.deepEqual(caps.mask_input_fields, ['mask', 'mask_path']);
-  assert.equal(caps.supports_custom_size, true);
-  assert.deepEqual(caps.size_presets, ['1K', '2K', '4K', 'auto']);
-  assert.match(caps.output_size_contract, /delivered output size tiers/);
-  assert.ok(caps.sizes.includes('3840x2160'));
-  assert.ok(caps.sizes.includes('2160x3840'));
-  assert.ok(caps.aspect_ratios.includes('9:16'));
-  assert.deepEqual(caps.formats, ['png', 'jpeg', 'webp']);
-  assert.deepEqual(caps.quality, ['low', 'medium', 'high', 'auto']);
-  assert.deepEqual(caps.statuses, ['queued', 'running', 'succeeded', 'failed', 'canceled', 'expired']);
-  assert.equal(caps.preferred_tool, 'create_image_job');
-  assert.equal(caps.default_request_timeout_ms, 15 * 60 * 1000);
-  assert.equal(caps.max_concurrent_jobs, 3);
-  assert.equal(caps.max_queued_jobs, 9);
-});
-
 test('validateImageInput rejects invalid image parameters locally', () => {
   assert.throws(
     () => validateImageInput({ prompt: '画图', size: '4097x1024' }, { requirePrompt: true }),
@@ -580,13 +551,17 @@ test('validateImageInput rejects invalid image parameters locally', () => {
   );
   assert.doesNotThrow(() => validateImageInput({
     prompt: '画图',
-    size: '2160x3840',
+    size: '3840x1648',
     quality: 'high',
     format: 'jpg',
     background: 'opaque',
     moderation: 'auto',
     output_compression: 80
   }, { requirePrompt: true }));
+  assert.throws(
+    () => validateImageInput({ prompt: '画图', size: '480x3840' }, { requirePrompt: true }),
+    (error) => error.code === 'invalid_size' && error.details.field === 'size'
+  );
 });
 
 test('generateImage rejects invalid parameters before calling upstream', async () => {
@@ -704,9 +679,14 @@ test('callImageTool throws a protocol error for unknown tools', async () => {
 });
 
 test('callImageTool exposes get_capabilities', async () => {
-  const result = await callImageTool('get_capabilities', {}, {});
+  const result = await callImageTool('get_capabilities', {}, {
+    env: { GPTEAM_API_KEY: 'synthetic-key', GPTEAM_BASE_URL: 'https://api.example.test/v1' },
+    capabilityCache: createCapabilityCache(),
+    fetch: async () => imageCapabilityResponse()
+  });
   assert.equal(result.ok, true);
-  assert.equal(result.supports_cancel, true);
+  assert.equal(result.revision, 'image-revision');
+  assert.deepEqual(result.models.map((model) => model.id), ['gpt-image-2']);
 });
 
 test('callImageTool maps legacy generate_image to async job to avoid MCP disconnects', async () => {
@@ -718,7 +698,10 @@ test('callImageTool maps legacy generate_image to async job to avoid MCP disconn
       GPTEAM_BASE_URL: 'https://api.example.test/v1',
       GPTEAM_IMAGE_OUTPUT_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'gpteam-image-mcp-'))
     },
-    fetch: async () => new Promise(() => {})
+    capabilityCache: createCapabilityCache(),
+    fetch: async (url) => String(url).endsWith('/gpteam/image-capabilities')
+      ? imageCapabilityResponse()
+      : new Promise(() => {})
   });
 
   assert.equal(result.ok, true);
@@ -745,6 +728,50 @@ function imageStreamFetchResponse(items) {
     status: 200,
     headers: { get: (name) => String(name).toLowerCase() === 'content-type' ? 'text/event-stream' : '' },
     text: async () => items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join('') + 'data: [DONE]\n\n'
+  };
+}
+
+function imageCapabilityResponse() {
+  const parameters = [{
+    name: 'prompt', description: '图片提示词', type: 'string', required: true,
+    ownership: 'forwarded', effect: 'upstream_effective'
+  }, {
+    name: 'output_path', description: '本地输出路径', type: 'string', required: false,
+    ownership: 'mcp_local', effect: 'gpteam_effective'
+  }];
+  const profile = {
+    id: 'openai-api-key-native', default_priority: 1,
+    provenance: 'verified_builtin', eligible: true, parameters
+  };
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => ({
+      object: 'gpteam.image_capabilities', schema_version: 1,
+      revision: 'image-revision', observed_at: '2026-07-15T12:00:00Z',
+      api_key: { id: 1 }, group: { id: 2, name: '图片测试', platform: 'openai' },
+      image_mcp: {
+        enabled: true, blocking_reasons: [],
+        default_models: { generate: 'gpt-image-2', edit: 'gpt-image-2' },
+        tools: ['create_image_job', 'get_image_job_status', 'download_image_result', 'cancel_image_job', 'get_capabilities'],
+        max_concurrent_jobs: 1, max_queued_jobs: 1,
+        models: [{
+          id: 'gpt-image-2', platform: 'openai', contract_revision: 1,
+          eligible: true, routable_by_contract: true,
+          actions: {
+            generate: { endpoint: '/v1/images/generations', eligible: true, execution_profiles: [profile] },
+            edit: { endpoint: '/v1/images/edits', eligible: true, execution_profiles: [{
+              ...profile,
+              parameters: [...parameters, {
+                name: 'images', description: '输入图片', type: 'string_array', required: true,
+                minimum_items: 1, ownership: 'forwarded', effect: 'upstream_effective'
+              }]
+            }] }
+          }
+        }]
+      }
+    })
   };
 }
 
