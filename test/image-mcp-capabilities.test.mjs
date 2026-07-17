@@ -6,6 +6,7 @@ import {
   createCapabilityCache,
   fetchImageCapabilities,
   normalizeImageCapabilities,
+  parameterJSONSchema,
   summarizeImageCapabilities
 } from '../lib/image-mcp/capabilities.js';
 import { normalizeCapabilityRequest } from '../lib/image-mcp/validation.js';
@@ -215,11 +216,13 @@ test('dynamic tools advertise explicit model/action oneOf branches and safe inte
   const capabilities = normalizeImageCapabilities(capabilityFixture());
   capabilities.models[0].actions.generate.profiles.push({
     ...structuredClone(capabilities.models[0].actions.generate.profiles[0]),
-    id: 'profile-b'
+    id: 'profile-b',
+    parameters: [...capabilities.models[0].actions.generate.profiles[0].parameters].reverse()
   });
   const tools = buildDynamicImageTools(capabilities, { supportsOneOf: true });
   const create = tools.find((tool) => tool.name === 'create_image_job');
   assert.equal(create.inputSchema.oneOf.length, 2, 'identical provider profiles must not create overlapping oneOf branches');
+  assert.equal(create.inputSchema.oneOf[0].anyOf, undefined, 'parameter order must not create duplicate profile branches');
   assert.equal(create.inputSchema.oneOf[0].required.includes('model'), true);
   assert.equal(create.inputSchema.oneOf[0].required.includes('action'), true);
   assert.equal(create.inputSchema.oneOf.some((branch) => branch.properties.aspect_ratio), true);
@@ -230,6 +233,31 @@ test('dynamic tools advertise explicit model/action oneOf branches and safe inte
   assert.deepEqual(fallback.properties.model.enum, ['gpt-image-2']);
   assert.equal(fallback.additionalProperties, false);
   assert.equal(fallback.properties.images, undefined, 'action-only fields cannot be widened into the intersection');
+});
+
+test('dynamic tools keep distinct execution profiles as exact parameter branches', () => {
+  const capabilities = normalizeImageCapabilities(capabilityFixture());
+  const action = capabilities.models[0].actions.generate;
+  const sharedPrompt = action.profiles[0].parameters.find((item) => item.name === 'prompt');
+  action.profiles = [
+    {
+      id: 'profile-a', default_priority: 1, provenance: 'verified_builtin',
+      parameters: [sharedPrompt, parameter('profile_a_only', 'string')]
+    },
+    {
+      id: 'profile-b', default_priority: 2, provenance: 'verified_builtin',
+      parameters: [sharedPrompt, parameter('profile_b_only', 'boolean')]
+    }
+  ];
+
+  const schema = buildDynamicImageTools(capabilities, { supportsOneOf: true })
+    .find((tool) => tool.name === 'create_image_job').inputSchema;
+  const generate = schema.oneOf.find((branch) => branch.properties?.action?.const === 'generate');
+  assert.equal(generate.anyOf.length, 2);
+  assert.equal(generate.anyOf.every((branch) => branch.additionalProperties === false), true);
+  assert.equal(generate.anyOf.some((branch) =>
+    branch.properties.profile_a_only && branch.properties.profile_b_only), false,
+  'no legal profile branch may advertise a cross-profile parameter union');
 });
 
 test('contract validator applies defaults and rejects model, action, parameter, enum, bounds, and dimensions', () => {
@@ -253,6 +281,25 @@ test('contract validator applies defaults and rejects model, action, parameter, 
   for (const [input, code] of cases) {
     assert.throws(() => normalizeCapabilityRequest(input, capabilities), (error) => error.code === code);
   }
+});
+
+test('string-array enums validate each item and publish item-level JSON Schema', () => {
+  const capabilities = normalizeImageCapabilities(capabilityFixture());
+  const images = capabilities.models[0].actions.edit.profiles[0].parameters
+    .find((parameter) => parameter.name === 'images');
+  images.enum = ['image-a', 'image-b'];
+
+  const valid = normalizeCapabilityRequest({
+    model: 'gpt-image-2', action: 'edit', prompt: 'x', images: ['image-a', 'image-b']
+  }, capabilities);
+  assert.deepEqual(valid.parameters.images, ['image-a', 'image-b']);
+  assert.throws(() => normalizeCapabilityRequest({
+    model: 'gpt-image-2', action: 'edit', prompt: 'x', images: ['image-a', 'image-c']
+  }, capabilities), (error) => error.code === 'unsupported_parameter');
+
+  const schema = parameterJSONSchema(images);
+  assert.deepEqual(schema.items.enum, ['image-a', 'image-b']);
+  assert.equal(schema.enum, undefined);
 });
 
 test('schema-v1 parser rejects malformed numeric bounds, defaults, enums, and compatibility-only fields', () => {
