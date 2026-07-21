@@ -48,6 +48,90 @@ test('dedicated schema-v1 fetch is authenticated, cached for at most 60 seconds,
   assert.equal(calls, 2, 'cache age must be capped at 60 seconds');
 });
 
+test('force refresh overlapping an ordinary inflight request performs one shared follow-up refresh', async () => {
+  let calls = 0;
+  let releaseOrdinary;
+  let releaseForced;
+  const ordinaryWaiting = new Promise((resolve) => { releaseOrdinary = resolve; });
+  const forcedWaiting = new Promise((resolve) => { releaseForced = resolve; });
+  const cache = createCapabilityCache({ hmacKey: Buffer.alloc(32, 8) });
+  const fetchImpl = async (_url, init) => {
+    calls += 1;
+    if (calls === 1) {
+      await ordinaryWaiting;
+      return jsonResponse(capabilityFixture({ revision: 'revision-old' }), { etag: '"revision-old"' });
+    }
+    assert.equal(init.headers['If-None-Match'], '"revision-old"');
+    await forcedWaiting;
+    return jsonResponse(capabilityFixture({ revision: 'revision-new' }), { etag: '"revision-new"' });
+  };
+
+  const ordinary = fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl });
+  const forcedA = fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl, forceRefresh: true });
+  const forcedB = fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl, forceRefresh: true });
+
+  releaseOrdinary();
+  assert.equal((await ordinary).revision, 'revision-old');
+  await Promise.resolve();
+  assert.equal(calls, 2, 'forced callers must start one follow-up request after the ordinary request settles');
+  releaseForced();
+  assert.equal((await forcedA).revision, 'revision-new');
+  assert.equal((await forcedB).revision, 'revision-new');
+  assert.equal(calls, 2, 'concurrent forced callers must share the follow-up refresh');
+});
+
+test('force refresh retries independently after an overlapping ordinary refresh fails', async () => {
+  let calls = 0;
+  let releaseOrdinary;
+  const ordinaryWaiting = new Promise((resolve) => { releaseOrdinary = resolve; });
+  const cache = createCapabilityCache({ hmacKey: Buffer.alloc(32, 10) });
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls === 1) {
+      await ordinaryWaiting;
+      throw new TypeError('ordinary refresh failed');
+    }
+    return jsonResponse(capabilityFixture({ revision: 'revision-recovered' }));
+  };
+
+  const ordinary = fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl });
+  const ordinaryRejected = assert.rejects(ordinary, (error) => error.code === 'capability_fetch_failed');
+  const forcedA = fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl, forceRefresh: true });
+  const forcedB = fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl, forceRefresh: true });
+
+  releaseOrdinary();
+  await ordinaryRejected;
+  assert.equal((await forcedA).revision, 'revision-recovered');
+  assert.equal((await forcedB).revision, 'revision-recovered');
+  assert.equal(calls, 2, 'forced callers must share one independent recovery request');
+});
+
+test('failed forced follow-up clears inflight state so the next force refresh can recover', async () => {
+  let calls = 0;
+  let releaseOrdinary;
+  const ordinaryWaiting = new Promise((resolve) => { releaseOrdinary = resolve; });
+  const cache = createCapabilityCache({ hmacKey: Buffer.alloc(32, 11) });
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls === 1) {
+      await ordinaryWaiting;
+      return jsonResponse(capabilityFixture({ revision: 'revision-old' }));
+    }
+    if (calls === 2) throw new TypeError('forced follow-up failed');
+    return jsonResponse(capabilityFixture({ revision: 'revision-recovered' }));
+  };
+
+  const ordinary = fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl });
+  const failedForce = fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl, forceRefresh: true });
+  releaseOrdinary();
+  assert.equal((await ordinary).revision, 'revision-old');
+  await assert.rejects(failedForce, (error) => error.code === 'capability_fetch_failed');
+
+  const recovered = await fetchImageCapabilities(credentialsA, { cache, fetch: fetchImpl, forceRefresh: true });
+  assert.equal(recovered.revision, 'revision-recovered');
+  assert.equal(calls, 3);
+});
+
 test('cache identity is process-local, HMAC-isolated by key, and never contains raw credentials', () => {
   const hmacKey = Buffer.alloc(32, 3);
   const first = capabilityCacheIdentity(credentialsA, hmacKey);
@@ -72,14 +156,13 @@ test('fresh refresh sends the previous revision and accepts only a matching 304 
   assert.equal(request, 2);
 });
 
-test('auth, empty, malformed, unsupported schema, redirect, and refresh failures fail closed', async () => {
+test('auth, malformed, unsupported schema, redirect, and refresh failures fail closed', async () => {
   const cases = [
     ['authentication', { ok: false, status: 401, text: async () => 'bad key' }, 'capability_authentication_failed'],
     ['permission', { ok: false, status: 403, text: async () => 'group disabled' }, 'capability_permission_denied'],
     ['redirect', { ok: false, status: 302, headers: headers({ location: 'https://other.example/' }) }, 'capability_redirect_rejected'],
     ['malformed', jsonResponse({ object: 'gpteam.image_capabilities', schema_version: 1 }), 'capability_response_invalid'],
-    ['unsupported schema', jsonResponse({ ...capabilityFixture(), schema_version: 2 }), 'capability_schema_unsupported'],
-    ['empty capability', jsonResponse(capabilityFixture({ image_mcp: disabledImageMCP() })), 'capability_empty']
+    ['unsupported schema', jsonResponse({ ...capabilityFixture(), schema_version: 2 }), 'capability_schema_unsupported']
   ];
   for (const [name, response, code] of cases) {
     await assert.rejects(
@@ -102,6 +185,16 @@ test('auth, empty, malformed, unsupported schema, redirect, and refresh failures
     }),
     (error) => error.code === 'capability_fetch_failed'
   );
+});
+
+test('empty capability is cached as a valid disabled contract instead of hiding local MCP tools', async () => {
+  const capabilities = await fetchImageCapabilities(credentialsA, {
+    cache: createCapabilityCache(),
+    fetch: async () => jsonResponse(capabilityFixture({ image_mcp: disabledImageMCP() }))
+  });
+  assert.equal(capabilities.enabled, false);
+  assert.deepEqual(capabilities.models, []);
+  assert.deepEqual(capabilities.blocking_reasons, ['insufficient_quota']);
 });
 
 test('schema-v1 endpoint absence never downgrades Image MCP to ordinary image routes', async () => {
@@ -179,37 +272,36 @@ test('contract-driven payload forwards only the selected provider profile parame
     })
   }));
   const normalized = normalizeCapabilityRequest({
-    model: 'gemini-3-pro-image', action: 'generate', prompt: '画一只猫', size: '4K', aspect_ratio: '16:9'
+    model: 'gemini-3-pro-image', action: 'generate', prompt: '画一只猫', size: '4k', aspect_ratio: '16:9'
   }, capabilities);
+  assert.equal(normalized.parameters.size, '4K');
   assert.deepEqual(buildImageGenerationPayload(normalized.parameters, { normalizedRequest: normalized }), {
     model: 'gemini-3-pro-image', prompt: '画一只猫', size: '4K', aspect_ratio: '16:9'
   });
 });
 
-test('dynamic tools advertise explicit model/action oneOf branches and safe intersection fallback', () => {
+test('dynamic tools publish a Claude Code safe root schema with the complete parameter superset', () => {
   const capabilities = normalizeImageCapabilities(capabilityFixture());
   capabilities.models[0].actions.generate.profiles.push({
     ...structuredClone(capabilities.models[0].actions.generate.profiles[0]),
     id: 'profile-b',
     parameters: [...capabilities.models[0].actions.generate.profiles[0].parameters].reverse()
   });
-  const tools = buildDynamicImageTools(capabilities, { supportsOneOf: true });
+  const tools = buildDynamicImageTools(capabilities);
   const create = tools.find((tool) => tool.name === 'create_image_job');
-  assert.equal(create.inputSchema.oneOf.length, 2, 'identical provider profiles must not create overlapping oneOf branches');
-  assert.equal(create.inputSchema.oneOf[0].anyOf, undefined, 'parameter order must not create duplicate profile branches');
-  assert.equal(create.inputSchema.oneOf[0].required.includes('model'), true);
-  assert.equal(create.inputSchema.oneOf[0].required.includes('action'), true);
-  assert.equal(create.inputSchema.oneOf.some((branch) => branch.properties.aspect_ratio), true);
-
-  const fallback = buildDynamicImageTools(capabilities, { supportsOneOf: false })
-    .find((tool) => tool.name === 'create_image_job').inputSchema;
-  assert.deepEqual(fallback.required, ['model', 'action', 'prompt']);
-  assert.deepEqual(fallback.properties.model.enum, ['gpt-image-2']);
-  assert.equal(fallback.additionalProperties, false);
-  assert.equal(fallback.properties.images, undefined, 'action-only fields cannot be widened into the intersection');
+  assert.equal(create.inputSchema.type, 'object');
+  assert.equal(create.inputSchema.oneOf, undefined);
+  assert.equal(create.inputSchema.anyOf, undefined);
+  assert.equal(create.inputSchema.allOf, undefined);
+  assert.deepEqual(create.inputSchema.required, ['model', 'action', 'prompt']);
+  assert.deepEqual(create.inputSchema.properties.model.enum, ['gpt-image-2']);
+  assert.deepEqual(create.inputSchema.properties.action.enum, ['generate', 'edit']);
+  assert.ok(create.inputSchema.properties.aspect_ratio);
+  assert.ok(create.inputSchema.properties.images, 'edit-only fields remain discoverable in the superset');
+  assert.equal(create.inputSchema.additionalProperties, false);
 });
 
-test('dynamic tools keep distinct execution profiles as exact parameter branches', () => {
+test('dynamic tools merge distinct execution profile fields for client hints while runtime validation stays exact', () => {
   const capabilities = normalizeImageCapabilities(capabilityFixture());
   const action = capabilities.models[0].actions.generate;
   const sharedPrompt = action.profiles[0].parameters.find((item) => item.name === 'prompt');
@@ -224,14 +316,55 @@ test('dynamic tools keep distinct execution profiles as exact parameter branches
     }
   ];
 
-  const schema = buildDynamicImageTools(capabilities, { supportsOneOf: true })
+  const schema = buildDynamicImageTools(capabilities)
     .find((tool) => tool.name === 'create_image_job').inputSchema;
-  const generate = schema.oneOf.find((branch) => branch.properties?.action?.const === 'generate');
-  assert.equal(generate.anyOf.length, 2);
-  assert.equal(generate.anyOf.every((branch) => branch.additionalProperties === false), true);
-  assert.equal(generate.anyOf.some((branch) =>
-    branch.properties.profile_a_only && branch.properties.profile_b_only), false,
-  'no legal profile branch may advertise a cross-profile parameter union');
+  assert.ok(schema.properties.profile_a_only);
+  assert.ok(schema.properties.profile_b_only);
+  assert.equal(schema.oneOf, undefined);
+
+  assert.throws(() => normalizeCapabilityRequest({
+    model: 'gpt-image-2', action: 'generate', prompt: 'x',
+    profile_a_only: 'a', profile_b_only: true
+  }, capabilities), (error) => error.code === 'unsupported_parameter');
+});
+
+test('all six tools stay discoverable with root-object input/output schemas when capability is empty', () => {
+  const capabilities = normalizeImageCapabilities(capabilityFixture({ image_mcp: disabledImageMCP() }));
+  const tools = buildDynamicImageTools(capabilities);
+  assert.deepEqual(tools.map((tool) => tool.name), [
+    'create_image_job', 'get_image_job_status', 'cancel_image_job',
+    'download_image_result', 'get_capabilities', 'generate_image'
+  ]);
+  for (const tool of tools) {
+    assert.equal(tool.inputSchema.type, 'object', tool.name);
+    assert.equal(tool.inputSchema.oneOf, undefined, tool.name);
+    assert.equal(tool.inputSchema.anyOf, undefined, tool.name);
+    assert.equal(tool.inputSchema.allOf, undefined, tool.name);
+    assert.equal(tool.outputSchema.type, 'object', tool.name);
+    assert.equal(tool.outputSchema.oneOf, undefined, tool.name);
+    assert.equal(JSON.stringify(tool.outputSchema).includes('image_base64'), false, tool.name);
+    assert.equal(JSON.stringify(tool.outputSchema).includes('b64'), false, tool.name);
+  }
+  assert.deepEqual(tools[0].inputSchema.properties.action.enum, ['generate', 'edit']);
+  assert.equal(tools[0].inputSchema.properties.model.enum, undefined);
+});
+
+test('Claude Code 2.1.195 and 2.1.198 root-combinator gate keeps both creation tools visible', () => {
+  const capabilitySets = [
+    normalizeImageCapabilities(capabilityFixture()),
+    normalizeImageCapabilities(capabilityFixture({ image_mcp: disabledImageMCP() }))
+  ];
+  for (const version of ['2.1.195', '2.1.198']) {
+    for (const capabilities of capabilitySets) {
+      const tools = buildDynamicImageTools(capabilities);
+      for (const toolName of ['create_image_job', 'generate_image']) {
+        const schema = tools.find((tool) => tool.name === toolName).inputSchema;
+        assert.equal(schema.oneOf, undefined, `${version} ${toolName}`);
+        assert.equal(schema.anyOf, undefined, `${version} ${toolName}`);
+        assert.equal(schema.allOf, undefined, `${version} ${toolName}`);
+      }
+    }
+  }
 });
 
 test('contract validator applies defaults and rejects model, action, parameter, enum, bounds, and dimensions', () => {
@@ -352,16 +485,29 @@ test('MCP tools/list and get_capabilities consume the dedicated Key-scoped contr
     capabilityCache: createCapabilityCache(),
     fetch: async (url) => {
       calls.push(String(url));
-      return jsonResponse(capabilityFixture());
+      return jsonResponse(capabilityFixture({ revision: calls.length === 1 ? 'revision-a' : 'revision-b' }));
     }
   };
   const tools = await listImageTools(deps);
   const create = tools.find((tool) => tool.name === 'create_image_job');
-  assert.equal(create.inputSchema.oneOf[0].required.includes('model'), true);
+  assert.equal(create.inputSchema.oneOf, undefined);
   const result = await callImageTool('get_capabilities', {}, deps);
-  assert.equal(result.revision, 'revision-a');
+  assert.equal(result.revision, 'revision-b');
   assert.deepEqual(result.models.map((model) => model.id), ['gpt-image-2']);
-  assert.equal(calls.length, 1, 'tools/list and get_capabilities share the Key-isolated cache');
+  assert.equal(calls.length, 2, 'get_capabilities must force a live refresh');
+});
+
+test('tools/list returns six static tools when live capability discovery fails', async () => {
+  const tools = await listImageTools({
+    env: { GPTEAM_API_KEY: 'synthetic-key-a', GPTEAM_BASE_URL: 'https://api.example.test/v1' },
+    capabilityCache: createCapabilityCache(),
+    fetch: async () => { throw new TypeError('network down'); }
+  });
+  assert.equal(tools.length, 6);
+  assert.deepEqual(tools.map((tool) => tool.name), [
+    'create_image_job', 'get_image_job_status', 'cancel_image_job',
+    'download_image_result', 'get_capabilities', 'generate_image'
+  ]);
 });
 
 test('queued jobs freeze contract identity and reject a revision change before upstream dispatch', async () => {

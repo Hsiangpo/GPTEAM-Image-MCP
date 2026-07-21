@@ -1,6 +1,6 @@
 {
   "name": "gpteam-image-mcp",
-  "version": "0.1.41",
+  "version": "0.1.42",
   "description": "GPTeam Image MCP server for image generation and editing through GPTeam OpenAI-compatible image APIs.",
   "type": "module",
   "bin": {
@@ -18,7 +18,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "https-proxy-agent": "7.0.6",
-    "proxy-from-env": "1.1.0"
+    "proxy-from-env": "1.1.0",
+    "undici": "6.27.0"
   },
   "engines": {
     "node": ">=18.18.0"

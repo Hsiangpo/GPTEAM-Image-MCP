@@ -20,7 +20,12 @@ import {
   toolResultContent,
   validateImageInput
 } from '../lib/image-mcp/image.js';
-import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError
+} from '@modelcontextprotocol/sdk/types.js';
 import { callImageTool, createServer, resolvePackageVersion } from '../lib/image-mcp/server.js';
 import { createCapabilityCache } from '../lib/image-mcp/capabilities.js';
 
@@ -667,6 +672,181 @@ test('createServer constructs MCP stdio server object', () => {
   assert.equal(typeof server.connect, 'function');
 });
 
+test('server advertises tools.listChanged and notifies exactly once when a forced refresh changes revision', async () => {
+  const handlers = new Map();
+  let notifications = 0;
+  let advertisedCapabilities;
+  let discoveryCalls = 0;
+  const protocolServer = {
+    setRequestHandler(schema, handler) {
+      handlers.set(schema, handler);
+    },
+    async sendToolListChanged() {
+      notifications += 1;
+    }
+  };
+  const deps = {
+    protocolServerFactory: (_serverInfo, options) => {
+      advertisedCapabilities = options.capabilities;
+      return protocolServer;
+    },
+    env: { GPTEAM_API_KEY: 'synthetic-key', GPTEAM_BASE_URL: 'https://api.example.test/v1' },
+    capabilityCache: createCapabilityCache(),
+    fetch: async () => {
+      discoveryCalls += 1;
+      const response = imageCapabilityResponse();
+      const originalJSON = response.json;
+      response.json = async () => ({
+        ...await originalJSON(),
+        revision: discoveryCalls === 1 ? 'revision-a' : 'revision-b'
+      });
+      return response;
+    }
+  };
+
+  assert.equal(createServer(deps), protocolServer);
+  assert.deepEqual(advertisedCapabilities, { tools: { listChanged: true } });
+  await handlers.get(ListToolsRequestSchema)({});
+  assert.equal(notifications, 0, 'initial tools/list establishes the revision baseline');
+
+  await handlers.get(CallToolRequestSchema)({
+    params: { name: 'get_capabilities', arguments: {} }
+  });
+  assert.equal(notifications, 1);
+
+  await handlers.get(CallToolRequestSchema)({
+    params: { name: 'get_capabilities', arguments: {} }
+  });
+  assert.equal(notifications, 1, 'unchanged revision must not emit duplicate notifications');
+});
+
+test('server retries tools.listChanged when the first notification attempt fails', async () => {
+  const handlers = new Map();
+  let notificationAttempts = 0;
+  let discoveryCalls = 0;
+  const protocolServer = {
+    setRequestHandler(schema, handler) {
+      handlers.set(schema, handler);
+    },
+    async sendToolListChanged() {
+      notificationAttempts += 1;
+      if (notificationAttempts === 1) throw new Error('temporary notification failure');
+    }
+  };
+  createServer({
+    protocolServerFactory: () => protocolServer,
+    env: { GPTEAM_API_KEY: 'synthetic-key', GPTEAM_BASE_URL: 'https://api.example.test/v1' },
+    capabilityCache: createCapabilityCache(),
+    fetch: async () => {
+      discoveryCalls += 1;
+      const response = imageCapabilityResponse();
+      const originalJSON = response.json;
+      response.json = async () => ({
+        ...await originalJSON(),
+        revision: discoveryCalls === 1 ? 'revision-a' : 'revision-b'
+      });
+      return response;
+    }
+  });
+
+  await handlers.get(ListToolsRequestSchema)({});
+  await handlers.get(CallToolRequestSchema)({
+    params: { name: 'get_capabilities', arguments: {} }
+  });
+  assert.equal(notificationAttempts, 1);
+
+  await handlers.get(CallToolRequestSchema)({
+    params: { name: 'get_capabilities', arguments: {} }
+  });
+  assert.equal(notificationAttempts, 2, '同一 revision 必须重试尚未成功发送的通知');
+
+  await handlers.get(CallToolRequestSchema)({
+    params: { name: 'get_capabilities', arguments: {} }
+  });
+  assert.equal(notificationAttempts, 2, '通知成功后同一 revision 不得重复发送');
+});
+
+test('server singleflights concurrent tools.listChanged notifications for one revision', async () => {
+  const handlers = new Map();
+  let notificationAttempts = 0;
+  let releaseNotification;
+  const notificationReleased = new Promise((resolve) => {
+    releaseNotification = resolve;
+  });
+  let discoveryCalls = 0;
+  const protocolServer = {
+    setRequestHandler(schema, handler) {
+      handlers.set(schema, handler);
+    },
+    async sendToolListChanged() {
+      notificationAttempts += 1;
+      await notificationReleased;
+    }
+  };
+  createServer({
+    protocolServerFactory: () => protocolServer,
+    env: { GPTEAM_API_KEY: 'synthetic-key', GPTEAM_BASE_URL: 'https://api.example.test/v1' },
+    capabilityCache: createCapabilityCache(),
+    fetch: async () => {
+      discoveryCalls += 1;
+      const response = imageCapabilityResponse();
+      const originalJSON = response.json;
+      response.json = async () => ({
+        ...await originalJSON(),
+        revision: discoveryCalls === 1 ? 'revision-a' : 'revision-b'
+      });
+      return response;
+    }
+  });
+
+  await handlers.get(ListToolsRequestSchema)({});
+  const firstRefresh = handlers.get(CallToolRequestSchema)({
+    params: { name: 'get_capabilities', arguments: {} }
+  });
+  const secondRefresh = handlers.get(CallToolRequestSchema)({
+    params: { name: 'get_capabilities', arguments: {} }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(notificationAttempts, 1, '同一 revision 的并发刷新只能共享一次通知发送');
+
+  releaseNotification();
+  await Promise.all([firstRefresh, secondRefresh]);
+  assert.equal(notificationAttempts, 1);
+});
+
+test('server notifies when live capability recovers after the initial tools/list fallback', async () => {
+  const handlers = new Map();
+  let notifications = 0;
+  let discoveryCalls = 0;
+  const protocolServer = {
+    setRequestHandler(schema, handler) {
+      handlers.set(schema, handler);
+    },
+    async sendToolListChanged() {
+      notifications += 1;
+    }
+  };
+  createServer({
+    protocolServerFactory: () => protocolServer,
+    env: { GPTEAM_API_KEY: 'synthetic-key', GPTEAM_BASE_URL: 'https://api.example.test/v1' },
+    capabilityCache: createCapabilityCache(),
+    fetch: async () => {
+      discoveryCalls += 1;
+      if (discoveryCalls === 1) throw new TypeError('temporary network failure');
+      return imageCapabilityResponse();
+    }
+  });
+
+  const listed = await handlers.get(ListToolsRequestSchema)({});
+  assert.equal(listed.tools.length, 6);
+  assert.equal(notifications, 0);
+
+  await handlers.get(CallToolRequestSchema)({
+    params: { name: 'get_capabilities', arguments: {} }
+  });
+  assert.equal(notifications, 1);
+});
+
 test('callImageTool throws a protocol error for unknown tools', async () => {
   await assert.rejects(
     callImageTool('unknown_tool', {}),
@@ -687,6 +867,28 @@ test('callImageTool exposes get_capabilities', async () => {
   assert.equal(result.ok, true);
   assert.equal(result.revision, 'image-revision');
   assert.deepEqual(result.models.map((model) => model.id), ['gpt-image-2']);
+});
+
+test('capability-backed tools preserve non-retryable proxy configuration errors', async () => {
+  const deps = {
+    env: {
+      GPTEAM_API_KEY: 'synthetic-key',
+      GPTEAM_BASE_URL: 'https://api.example.test/v1',
+      ALL_PROXY: 'socks5://127.0.0.1:1080'
+    },
+    capabilityCache: createCapabilityCache()
+  };
+
+  for (const [toolName, args] of [
+    ['get_capabilities', {}],
+    ['create_image_job', { model: 'gpt-image-2', action: 'generate', prompt: '画一只猫' }]
+  ]) {
+    const result = await callImageTool(toolName, args, deps);
+    assert.equal(result.ok, false, toolName);
+    assert.equal(result.error.code, 'proxy_protocol_unsupported', toolName);
+    assert.equal(result.error.retryable, false, toolName);
+    assert.equal(result.error.stage, 'configuration', toolName);
+  }
 });
 
 test('callImageTool maps legacy generate_image to async job to avoid MCP disconnects', async () => {
