@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import {
   buildDynamicImageTools,
@@ -9,14 +12,23 @@ import {
   parameterJSONSchema,
   summarizeImageCapabilities
 } from '../lib/image-mcp/capabilities.js';
-import { normalizeCapabilityRequest } from '../lib/image-mcp/validation.js';
-import { buildImageGenerationPayload, createImageJobStore, getImageJobStatus } from '../lib/image-mcp/image.js';
+import { normalizeCapabilityRequest, validateFrozenCapability } from '../lib/image-mcp/validation.js';
+import {
+  buildImageGenerationPayload,
+  createImageJobStore,
+  getImageJobStatus,
+  POPULAR_IMAGE_SIZES
+} from '../lib/image-mcp/image.js';
 import { callImageTool, listImageTools } from '../lib/image-mcp/server.js';
 
 const credentialsA = {
   apiKey: 'synthetic-key-a',
   baseUrl: 'https://api.example.test/v1'
 };
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lAQcIgAAAABJRU5ErkJggg==',
+  'base64'
+);
 
 test('dedicated schema-v1 fetch is authenticated, cached for at most 60 seconds, and singleflight', async () => {
   let now = 1_000;
@@ -195,6 +207,25 @@ test('empty capability is cached as a valid disabled contract instead of hiding 
   assert.equal(capabilities.enabled, false);
   assert.deepEqual(capabilities.models, []);
   assert.deepEqual(capabilities.blocking_reasons, ['insufficient_quota']);
+});
+
+test('disabled capability requires at least one non-empty blocking reason', async (context) => {
+  for (const [name, blockingReasons] of [
+    ['empty array', []],
+    ['blank strings', ['', '   ']]
+  ]) {
+    await context.test(name, () => {
+      assert.throws(
+        () => normalizeImageCapabilities(capabilityFixture({
+          image_mcp: { ...disabledImageMCP(), blocking_reasons: blockingReasons }
+        })),
+        (error) => error.code === 'capability_response_invalid'
+      );
+    });
+  }
+
+  const valid = normalizeImageCapabilities(capabilityFixture({ image_mcp: disabledImageMCP() }));
+  assert.deepEqual(valid.blocking_reasons, ['insufficient_quota']);
 });
 
 test('schema-v1 endpoint absence never downgrades Image MCP to ordinary image routes', async () => {
@@ -388,6 +419,150 @@ test('contract validator applies defaults and rejects model, action, parameter, 
   for (const [input, code] of cases) {
     assert.throws(() => normalizeCapabilityRequest(input, capabilities), (error) => error.code === code);
   }
+});
+
+test('format and output_format synchronize only when the user does not explicitly conflict', async (context) => {
+  const capabilities = normalizeImageCapabilities(capabilityFixture());
+  const accepted = [
+    ['only output_format jpeg', { output_format: 'jpeg' }, 'jpeg'],
+    ['only output_format webp', { output_format: 'webp' }, 'webp'],
+    ['only format jpeg', { format: 'jpeg' }, 'jpeg'],
+    ['only format webp', { format: 'webp' }, 'webp'],
+    ['both jpeg', { format: 'jpeg', output_format: 'jpeg' }, 'jpeg'],
+    ['both webp', { format: 'webp', output_format: 'webp' }, 'webp']
+  ];
+
+  for (const [name, fields, expected] of accepted) {
+    await context.test(name, () => {
+      const normalized = normalizeCapabilityRequest({
+        model: 'gpt-image-2', action: 'generate', prompt: '画一只猫', ...fields
+      }, capabilities);
+      assert.equal(normalized.parameters.format, expected);
+      assert.equal(normalized.parameters.output_format, expected);
+      assert.equal(normalized.forwarded_parameters.output_format, expected);
+      assert.equal(normalized.forwarded_parameters.format, undefined);
+      assert.equal(normalized.mcp_local_parameters.format, expected);
+      assert.equal(normalized.mcp_local_parameters.output_format, undefined);
+    });
+  }
+
+  for (const [name, fields] of [
+    ['jpeg versus webp', { format: 'jpeg', output_format: 'webp' }],
+    ['webp versus jpeg', { format: 'webp', output_format: 'jpeg' }]
+  ]) {
+    await context.test(name, () => {
+      assert.throws(() => normalizeCapabilityRequest({
+        model: 'gpt-image-2', action: 'generate', prompt: '画一只猫', ...fields
+      }, capabilities), (error) => error.code === 'unsupported_parameter');
+    });
+  }
+
+  for (const [name, fields] of [
+    ['format null', { format: null }],
+    ['output_format null', { output_format: null }]
+  ]) {
+    await context.test(name, () => {
+      assert.throws(() => normalizeCapabilityRequest({
+        model: 'gpt-image-2', action: 'generate', prompt: '画一只猫', ...fields
+      }, capabilities), (error) => error.code === 'unsupported_parameter');
+    });
+  }
+
+  for (const [name, fields] of [
+    ['format undefined', { format: undefined }],
+    ['output_format undefined', { output_format: undefined }]
+  ]) {
+    await context.test(name, () => {
+      const snapshot = normalizeCapabilityRequest({
+        model: 'gpt-image-2', action: 'generate', prompt: '画一只猫', ...fields
+      }, capabilities);
+      assert.equal(snapshot.parameters.format, 'png');
+      assert.equal(snapshot.parameters.output_format, 'png');
+
+      const serialized = JSON.parse(JSON.stringify(snapshot));
+      const validated = validateFrozenCapability(serialized, normalizeImageCapabilities(capabilityFixture()));
+      assert.deepEqual(validated.parameters, serialized.parameters);
+    });
+  }
+});
+
+test('conflicting format defaults fail closed when neither field is explicit', () => {
+  const payload = capabilityFixture();
+  const parameters = payload.image_mcp.models[0].actions.generate.execution_profiles[0].parameters;
+  parameters.find((item) => item.name === 'format').default = 'webp';
+  parameters.find((item) => item.name === 'output_format').default = 'png';
+  const capabilities = normalizeImageCapabilities(payload);
+
+  assert.throws(() => normalizeCapabilityRequest({
+    model: 'gpt-image-2', action: 'generate', prompt: '画一只猫'
+  }, capabilities), (error) => error.code === 'unsupported_parameter');
+});
+
+test('valid WxH derives a reduced aspect ratio only when the active profile supports it', async (context) => {
+  const capabilities = normalizeImageCapabilities(capabilityFixture());
+  const cases = [
+    ['1536x1024', '3:2'],
+    ['1024x1536', '2:3'],
+    ['2048x1152', '16:9'],
+    ['1280x960', '4:3']
+  ];
+  assert.equal(POPULAR_IMAGE_SIZES.some((item) => item.size === '1280x960'), false);
+
+  for (const [size, aspectRatio] of cases) {
+    await context.test(`${size} becomes ${aspectRatio}`, () => {
+      const normalized = normalizeCapabilityRequest({
+        model: 'gpt-image-2', action: 'generate', prompt: '画一只猫', size
+      }, capabilities);
+      assert.equal(normalized.parameters.aspect_ratio, aspectRatio);
+      assert.equal(normalized.forwarded_parameters.aspect_ratio, aspectRatio);
+    });
+  }
+
+  await context.test('unsupported reduced ratio keeps the profile default', () => {
+    const payload = capabilityFixture();
+    const aspectRatio = payload.image_mcp.models[0].actions.generate.execution_profiles[0].parameters
+      .find((item) => item.name === 'aspect_ratio');
+    aspectRatio.enum = ['auto', '1:1', '16:9'];
+    const restricted = normalizeImageCapabilities(payload);
+    const normalized = normalizeCapabilityRequest({
+      model: 'gpt-image-2', action: 'generate', prompt: '画一只猫', size: '1536x1024'
+    }, restricted);
+    assert.equal(normalized.parameters.aspect_ratio, 'auto');
+  });
+
+  await context.test('explicit aspect_ratio wins over the size-derived ratio', () => {
+    const normalized = normalizeCapabilityRequest({
+      model: 'gpt-image-2', action: 'generate', prompt: '画一只猫',
+      size: '1536x1024', aspect_ratio: '16:9'
+    }, capabilities);
+    assert.equal(normalized.parameters.aspect_ratio, '16:9');
+  });
+
+  await context.test('profile defaults do not count as an explicit WxH request', () => {
+    const normalized = normalizeCapabilityRequest({
+      model: 'gpt-image-2', action: 'generate', prompt: '画一只猫'
+    }, capabilities);
+    assert.equal(normalized.parameters.size, '1024x1024');
+    assert.equal(normalized.parameters.aspect_ratio, 'auto');
+  });
+});
+
+test('popular 1536x1024 and 1024x1536 dimensions use the current 2K display tier', async (context) => {
+  for (const [size, label] of [['1536x1024', '2K 横图'], ['1024x1536', '2K 竖图']]) {
+    await context.test(size, () => {
+      assert.equal(POPULAR_IMAGE_SIZES.find((item) => item.size === size)?.label, label);
+    });
+  }
+});
+
+test('format synchronization and derived aspect ratio keep frozen capability snapshots idempotent', () => {
+  const capabilities = normalizeImageCapabilities(capabilityFixture());
+  const snapshot = normalizeCapabilityRequest({
+    model: 'gpt-image-2', action: 'generate', prompt: '画一只猫',
+    output_format: 'webp', size: '1536x1024'
+  }, capabilities);
+  const validated = validateFrozenCapability(snapshot, normalizeImageCapabilities(capabilityFixture()));
+  assert.deepEqual(validated.parameters, snapshot.parameters);
 });
 
 test('string-array enums validate each item and publish item-level JSON Schema', () => {
@@ -615,6 +790,109 @@ test('cached tool schemas cannot bypass runtime validation and dynamic dispatch 
 	assert.deepEqual(imageURLs, ['https://api.example.test/v1/gpteam/image-mcp/images/generations']);
 });
 
+test('create_image_job synchronizes one format field and derives aspect ratio before dedicated dispatch', async (context) => {
+  for (const [name, formatField] of [
+    ['format only', { format: 'webp' }],
+    ['output_format only', { output_format: 'webp' }]
+  ]) {
+    await context.test(name, async (subtest) => {
+      const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gpteam-image-mcp-contract-'));
+      subtest.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+      const capabilityRequests = [];
+      const imageRequests = [];
+      const store = createImageJobStore();
+      const deps = {
+        store,
+        env: {
+          GPTEAM_API_KEY: 'synthetic-key-a',
+          GPTEAM_BASE_URL: 'https://api.example.test/v1',
+          GPTEAM_IMAGE_OUTPUT_DIR: outputDir
+        },
+        capabilityCache: createCapabilityCache(),
+        fetch: async (url, init = {}) => {
+          if (String(url).endsWith('/gpteam/image-capabilities')) {
+            capabilityRequests.push({ url: String(url), init });
+            return jsonResponse(capabilityFixture());
+          }
+          imageRequests.push({ url: String(url), init });
+          return jsonResponse({ data: [{ b64_json: PNG_1X1.toString('base64') }] });
+        }
+      };
+
+      const created = await callImageTool('create_image_job', {
+        model: 'gpt-image-2', action: 'generate', prompt: '画一只猫',
+        size: '1536x1024', ...formatField
+      }, deps);
+      assert.equal(created.ok, true, JSON.stringify(created.error));
+      assert.match(created.job_id, /^img_/);
+      const status = await waitForStatus(store, created.job_id, 'succeeded');
+      assert.equal(status.status, 'succeeded');
+      assert.equal(capabilityRequests.length, 2, 'discovery and pre-dispatch force refresh both run');
+      assert.equal(imageRequests.length, 1);
+      assert.equal(imageRequests[0].url, 'https://api.example.test/v1/gpteam/image-mcp/images/generations');
+      assert.equal(imageRequests[0].init.method, 'POST');
+      const body = JSON.parse(imageRequests[0].init.body);
+      assert.equal(body.size, '1536x1024');
+      assert.equal(body.aspect_ratio, '3:2');
+      assert.equal(body.output_format, 'webp');
+      assert.equal(Object.prototype.hasOwnProperty.call(body, 'format'), false);
+    });
+  }
+
+  await context.test('explicit conflict fails before queueing or image POST', async () => {
+    let imageCalls = 0;
+    const store = createImageJobStore();
+    const result = await callImageTool('create_image_job', {
+      model: 'gpt-image-2', action: 'generate', prompt: '画一只猫',
+      format: 'jpeg', output_format: 'webp'
+    }, {
+      store,
+      env: { GPTEAM_API_KEY: 'synthetic-key-a', GPTEAM_BASE_URL: 'https://api.example.test/v1' },
+      capabilityCache: createCapabilityCache(),
+      fetch: async (url) => {
+        if (String(url).endsWith('/gpteam/image-capabilities')) return jsonResponse(capabilityFixture());
+        imageCalls += 1;
+        return jsonResponse({ data: [{ b64_json: PNG_1X1.toString('base64') }] });
+      }
+    });
+    assert.equal(result.error.code, 'unsupported_parameter');
+    assert.equal(store.jobs.size, 0);
+    assert.equal(imageCalls, 0);
+  });
+
+  for (const [name, nullField] of [
+    ['format null', { format: null }],
+    ['output_format null', { output_format: null }]
+  ]) {
+    await context.test(`${name} fails before queueing or image POST`, async (subtest) => {
+      const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gpteam-image-mcp-null-format-'));
+      subtest.after(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+      let imageCalls = 0;
+      const store = createImageJobStore();
+      const result = await callImageTool('create_image_job', {
+        model: 'gpt-image-2', action: 'generate', prompt: '画一只猫', ...nullField
+      }, {
+        store,
+        env: {
+          GPTEAM_API_KEY: 'synthetic-key-a',
+          GPTEAM_BASE_URL: 'https://api.example.test/v1',
+          GPTEAM_IMAGE_OUTPUT_DIR: outputDir
+        },
+        capabilityCache: createCapabilityCache(),
+        fetch: async (url) => {
+          if (String(url).endsWith('/gpteam/image-capabilities')) return jsonResponse(capabilityFixture());
+          imageCalls += 1;
+          return jsonResponse({ data: [{ b64_json: PNG_1X1.toString('base64') }] });
+        }
+      });
+      if (result.ok) await waitForStatus(store, result.job_id, 'succeeded');
+      assert.deepEqual({ code: result.error?.code, jobs: store.jobs.size, imageCalls }, {
+        code: 'unsupported_parameter', jobs: 0, imageCalls: 0
+      });
+    });
+  }
+});
+
 function capabilityFixture(overrides = {}) {
   const base = {
     object: 'gpteam.image_capabilities',
@@ -668,7 +946,11 @@ function modelFixture(overrides = {}) {
       ] }
     }),
     parameter('quality', 'string', { enum: ['low', 'medium', 'high', 'auto'], default: 'high' }),
-    parameter('aspect_ratio', 'string', { enum: ['auto', '1:1', '16:9'], default: 'auto' }),
+    parameter('aspect_ratio', 'string', { enum: ['auto', '1:1', '16:9', '3:2', '2:3', '4:3'], default: 'auto' }),
+    parameter('output_format', 'string', { enum: ['png', 'jpeg', 'webp'], default: 'png' }),
+    parameter('format', 'string', {
+      enum: ['png', 'jpeg', 'webp'], default: 'png', ownership: 'mcp_local', effect: 'gpteam_effective'
+    }),
     parameter('output_compression', 'integer', { minimum: 0, maximum: 100 }),
     parameter('output_path', 'string', { ownership: 'mcp_local', effect: 'gpteam_effective' }),
     parameter('overwrite', 'boolean', { default: false, ownership: 'mcp_local', effect: 'gpteam_effective' }),
