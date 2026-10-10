@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
   buildImageGenerationPayload,
   cancelImageJob,
@@ -994,3 +996,24 @@ async function waitUntil(condition) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+test('MCP initialization routes image requests through its discoverable async tools', async (t) => {
+  const server = createServer({
+    env: { GPTEAM_API_KEY: 'synthetic-test-key', GPTEAM_BASE_URL: 'https://api.example.test' },
+    fetch: async () => { throw new Error('capability temporarily unavailable'); }
+  });
+  const client = new Client({ name: 'image-routing-regression', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  t.after(async () => { await client.close(); await server.close(); });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const instructions = client.getInstructions();
+  assert.equal(typeof instructions, 'string');
+  const tools = (await client.listTools()).tools.map((tool) => tool.name);
+  for (const name of ['get_capabilities', 'create_image_job', 'get_image_job_status', 'download_image_result']) {
+    assert.ok(instructions.includes(name), `initialization must explain ${name}`);
+    assert.ok(tools.includes(name), `initialization must refer to a discoverable tool: ${name}`);
+  }
+  assert.ok(instructions.includes('image_generation'), 'instructions must explain the unsupported hosted entry');
+  assert.ok(!instructions.includes('synthetic-test-key'), 'initialization must not disclose credentials');
+});

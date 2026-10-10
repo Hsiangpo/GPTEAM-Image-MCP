@@ -23,6 +23,15 @@ Node.js 需要 `18.18.0` 或更高版本。推荐先运行 `npx gpteam`，让 GP
 }
 ```
 
+Codex 接入 GPTEAM 时，`npx gpteam` 会自动关闭内置托管生图并按 Key 权限配置本 MCP。手工配置 GitHub 入口时，也请把下面开关合并到现有 `config.toml` 的 `[features]` 表：
+
+```toml
+[features]
+image_generation = false
+```
+
+已有 `[features]` 时不要重复声明该表。保存后完全退出重开 Codex，并新建会话。MCP 初始化会提示先调用 `get_capabilities`，再通过创建任务、轮询和下载完成生图；工具不可用时先检查 MCP 启动和 Key 权限，不要切回内置托管工具。
+
 真实 Key 只放在本机 MCP 环境变量中，不要写进仓库、截图或日志。MCP 不会把 `OPENAI_API_KEY` 当作 GPTEAM Key。
 
 ## 动态能力流程
